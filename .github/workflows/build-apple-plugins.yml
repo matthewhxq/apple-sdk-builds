@@ -1,0 +1,115 @@
+name: Build Apple Unity plugins
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: build-apple-unity-plugins
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event.repository.private == false
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      SOURCE_REVISION: c9da61c5a091295aa4722990c60fe6d316c4f01b
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch pinned Apple source
+        run: |
+          git init source
+          git -C source remote add origin https://github.com/apple/unityplugins.git
+          git -c credential.helper= -C source fetch --depth=1 origin "$SOURCE_REVISION"
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_REVISION"
+
+      - name: Check Xcode and SDKs
+        run: |
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version
+          xcodebuild -version | grep -qx 'Xcode 26.3'
+          for sdk in iphoneos macosx; do
+            version=$(xcrun --sdk "$sdk" --show-sdk-version)
+            echo "$sdk SDK: $version"
+            test "${version%%.*}" -ge 26
+          done
+          python3 --version
+
+      - name: Build and pack Core and GameKit
+        working-directory: source
+        env:
+          XCODE_XCCONFIG_FILE: ${{ runner.temp }}/unsigned.xcconfig
+        run: |
+          cat > "$XCODE_XCCONFIG_FILE" <<'EOF'
+          CODE_SIGNING_ALLOWED = NO
+          CODE_SIGNING_REQUIRED = NO
+          CODE_SIGN_IDENTITY =
+          DEVELOPMENT_TEAM =
+          ONLY_ACTIVE_ARCH = NO
+          EOF
+          python3 -u build.py \
+            --plugin-list Core GameKit \
+            --platforms iOS macOS \
+            --build-config all \
+            --build-action build pack \
+            --codesign-identity - \
+            --no-color < /dev/null
+
+      - name: Verify packages and native libraries
+        working-directory: source
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import tarfile
+          from pathlib import Path
+
+          packages = {
+              "Core": ("3.2.0", "AppleCoreNative", "AppleCoreNativeMac"),
+              "GameKit": ("4.0.1", "GameKitWrapper", "GameKitWrapper"),
+          }
+          expected = {f"com.apple.unityplugin.{name.lower()}-{info[0]}.tgz"
+                      for name, info in packages.items()}
+          actual = {path.name for path in Path("Build").glob("*.tgz")}
+          if actual != expected:
+              raise SystemExit(f"Unexpected package set: {actual}; expected {expected}")
+
+          for name, (version, ios_binary, mac_binary) in packages.items():
+              package_id = f"com.apple.unityplugin.{name.lower()}"
+              package_root = Path(f"plug-ins/Apple.{name}/Apple.{name}_Unity/Assets/Apple.{name}")
+              with tarfile.open(f"Build/{package_id}-{version}.tgz", "r:gz") as archive:
+                  manifest = json.load(archive.extractfile("package/package.json"))
+                  if (manifest["name"], manifest["version"]) != (package_id, version):
+                      raise SystemExit(f"Unexpected manifest: {manifest}")
+                  for config in ("Debug", "Release"):
+                      for platform, library, binary, arches in (
+                          ("iOS", f"{ios_binary}.framework", ios_binary, ["arm64"]),
+                          ("macOS", f"{mac_binary}.bundle", f"Contents/MacOS/{mac_binary}", ["arm64", "x86_64"]),
+                      ):
+                          relative = f"NativeLibraries~/{config}/{platform}/{library}"
+                          member = archive.getmember(f"package/{relative}/{binary}")
+                          if not member.isfile() or member.size == 0:
+                              raise SystemExit(f"Missing native binary: {member.name}")
+                          native = package_root / relative
+                          subprocess.run(["codesign", "--verify", "--strict", str(native)], check=True)
+                          subprocess.run(["lipo", str(native / binary), "-verify_arch", *arches], check=True)
+              print(f"Verified {package_id} {version}")
+          PY
+          shasum -a 256 Build/*.tgz
+          printf 'Apple source: `%s`\n\nXcode 26.3; iOS + macOS; Debug + Release; ad-hoc signed.\n' \
+            "$SOURCE_REVISION" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Unity packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apple-core-gamekit-ios-macos-${{ env.SOURCE_REVISION }}
+          path: source/Build/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
