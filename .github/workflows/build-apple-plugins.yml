@@ -32,8 +32,9 @@ jobs:
       - name: Check Xcode and SDKs
         run: |
           test -d "$DEVELOPER_DIR"
-          xcodebuild -version
-          xcodebuild -version | grep -qx 'Xcode 26.3'
+          xcode_version=$(xcodebuild -version)
+          printf '%s\n' "$xcode_version"
+          grep -qx 'Xcode 26.3' <<< "$xcode_version"
           for sdk in iphoneos macosx; do
             version=$(xcrun --sdk "$sdk" --show-sdk-version)
             echo "$sdk SDK: $version"
